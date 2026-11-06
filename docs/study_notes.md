@@ -26,3 +26,39 @@ How to use this file:
 | `tests/` | Small checks that each part works correctly, for example "does the tokenizer decode back to the same text?" |
 
 ---
+
+## Dataset formats
+
+### Text formats (you can open and read them)
+
+| Format | What it is | Use it for |
+|--------|------------|------------|
+| CSV / TSV | Rows and columns, separated by commas or tabs | Simple tables. Bad for multi-line text. |
+| JSON | One big list of objects | Small datasets and config files |
+| JSONL | One JSON object per line | Text pairs for language models |
+| TXT | Plain text, no structure | Raw text for pretraining |
+
+### Binary formats (fast, but not human-readable)
+
+| Format | What it is | Use it for |
+|--------|------------|------------|
+| Parquet | Compressed table | Large tables (pandas, Hugging Face) |
+| Arrow | Fast in-memory table | Hugging Face `datasets` |
+| .npy / .npz | NumPy array | Arrays of numbers, like token IDs |
+| .pt | PyTorch tensor | Tensors saved with `torch.save` |
+| .bin | Raw array of numbers | Token IDs; the fastest to load in training |
+| HDF5 (.h5) | Large numeric arrays | Scientific data |
+| TFRecord | TensorFlow format | TensorFlow only |
+
+### In this project
+
+```
+draft_examples.md  -->  dataset.jsonl  -->  token IDs (.bin / .pt / .npy)
+   (design)              (raw text)           (what the model trains on)
+```
+
+- **Raw data is JSONL:** each example has two fields (`intent`, `spec`), and the spec has many lines.
+- **Processed data is binary:** the model only reads numbers.
+- **Phase 2 (T5):** Hugging Face loads the same JSONL and turns it into Arrow by itself.
+
+---
