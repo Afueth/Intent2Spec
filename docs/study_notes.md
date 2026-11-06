@@ -126,9 +126,30 @@ draft_examples.md  -->  dataset.jsonl  -->  token IDs (.bin / .pt / .npy)
 - Trained on `train.jsonl` only, saved to `tokenizer/bpe_3000.json`, with 11 unit tests.
 - Details: see **Tokenization (BPE)** below.
 
-### Next: Step 04, prepare the training data
+### Step 04: Prepare the training data
 
-- Turn every pair into token IDs, choose a max sequence length, build a PyTorch `Dataset` and `DataLoader`.
+- Measured sequence lengths and chose `max_len = 512` (no pair is cut off).
+- Tokenized all pairs and saved them to `data/processed/` (`train.pt`, `val.pt`, `test.pt`).
+- Built a PyTorch `Dataset` and `DataLoader` with input/target shift, padding and a loss mask.
+- Details: see **Data preparation** below.
+
+### Step 05: Build the model
+
+- Built a GPT-style Transformer from scratch: **11,998,080 parameters** (about 12M).
+- 6 blocks, 6 attention heads, 384-number vectors, context of 512 tokens.
+- 9 unit tests (shapes, causal mask, loss mask, gradients, memorizing one batch).
+- Details: see **The model (Transformer)** below.
+
+### Step 06: Train the model (done)
+
+- Sanity check: the model memorized 5 examples (loss 8.04 -> 0.02) and reproduced one spec exactly.
+- Full training: 800 pairs, 20 epochs, 71.5 minutes on CPU.
+- Best val loss 3.2768 at epoch 19 (from 8.06 at the start). Saved to `checkpoints/best.pt`.
+- Details: see **Training** below.
+
+### Next: Step 07, generate specs
+
+- Load `checkpoints/best.pt` and write a spec for a new intent, one token at a time.
 
 ---
 
@@ -354,5 +375,335 @@ Results:
 | `tests/test_tokenizer.py` | Unit tests |
 
 - **Why `python -m tokenizer.train_tokenizer`:** `-m` runs the file as a module from the project root, so Python can find the `tokenizer` package for `from tokenizer.bpe import ...`.
+
+---
+
+## Data preparation (step 04)
+
+### Part A: choosing the max sequence length
+
+The model has a fixed **context length**: the most tokens it can see at once.
+
+| Split | Median | Longest |
+|-------|--------|---------|
+| train | 226 tokens | 455 |
+| val | 231 | 407 |
+| test | 212 | 399 |
+
+| Option | Pairs cut off (train) | Verdict |
+|--------|-----------------------|---------|
+| 256 | 250 of 800 | Too short |
+| 384 | 13 | Close |
+| **512** | **0** | **Chosen** |
+
+- **Truncation is harmful:** a cut-off sequence loses the end of the spec and the `<eos>` token, so the model never learns to finish.
+- **Longer is not free:** attention compares every token with every other token, so cost grows with **length²**.
+
+### Part B: tokenize once, save to `data/processed/`
+
+- `scripts/prepare_data.py` encodes every pair with `encode_pair()` and saves a list per split:
+
+| Field | Example | Used for |
+|-------|---------|----------|
+| `ids` | `tensor([3001, 3003, 2762, ...])` | The sequence the model reads |
+| `spec_start` | `28` | Where the spec begins (for the loss mask) |
+
+- `dtype=torch.long`: the embedding layer needs token IDs as 64-bit integers.
+- Training reads the data thousands of times, so encoding once is faster and keeps every run identical.
+- `data/processed/` is not committed: it can be recreated with `python -m scripts.prepare_data`.
+- **Training tokens: 183,153** (val 23,684, test 22,400).
+
+### Part C: input and target (shift by one)
+
+The model predicts the next token at every position at once:
+```
+ids: <bos> <intent> I  want ... <spec> Type  :  ... <eos>
+x  : <bos> <intent> I  want ... <spec> Type  :  ...
+y  : <intent> I  want  ... <spec> Type  :  ... <eos>
+```
+At position `t` the model sees `x[0..t]` and must predict `y[t]`.
+
+### Part D: the loss mask
+
+- Targets inside the intent part are set to **`-100`**. Cross-entropy **skips** any target equal to `-100`.
+```
+y:  -100 -100 ... -100  Type  :  ...  <eos>
+    └─ intent: no loss ┘ └── spec: loss ──┘
+```
+- **Why:** the user writes the intent; the model only ever has to write the spec. Learning to predict the intent wastes capacity.
+- First trained target is `Type` (right after `<spec>`); last is `<eos>`, so the model learns when to stop.
+
+### Padding and batching (`collate`)
+
+- A batch is one tensor, so all rows must have the same length. Short rows are filled:
+  - `x` with `<pad>` (3000)
+  - `y` with `-100`, so padding is never in the loss
+- **Dynamic padding:** pad to the longest sequence **in the batch** (e.g. 308), not to 512. Saves a lot of computation.
+- **Padding cannot confuse the model:** attention is causal (tokens only see earlier tokens) and padding comes after the real tokens.
+- `DataLoader`: `batch_size=16` gives 50 batches per epoch; `shuffle=True` for training only.
+
+### Data preparation files
+
+| File | What it is |
+|------|------------|
+| `scripts/seq_lengths.py` | Measures sequence lengths |
+| `scripts/prepare_data.py` | Tokenizes all splits and saves `.pt` files |
+| `training/dataset.py` | `SpecDataset`, `collate` (padding), `make_loader` |
+| `training/try_loader.py` | Shows one batch and the loss mask |
+
+- Git warning `CRLF will be replaced by LF`: harmless. Windows ends lines with CRLF, Linux with LF; `.gitattributes` stores files with LF.
+
+---
+
+## The model (Transformer, step 05)
+
+### The full pipeline
+
+```
+token IDs (B, T)
+  -> Embeddings          token + position vectors     (B, T, 384)
+  -> Block x 6           attention + feed-forward     (B, T, 384)
+  -> LayerNorm (ln_f)    final normalization          (B, T, 384)
+  -> head (Linear)       a score for every token      (B, T, 3005)
+  -> cross-entropy       compare with targets          one number: the loss
+```
+
+| Letter | Meaning |
+|--------|---------|
+| `B` | Batch size: sequences processed together |
+| `T` | Sequence length in tokens |
+| `C` | Vector size per token (`d_embed` = 384) |
+
+### Settings (`GPTConfig`)
+
+| Setting | Value | Meaning |
+|---------|-------|---------|
+| `vocab_size` | 3005 | Tokens the model knows |
+| `context_len` | 512 | Longest sequence |
+| `n_layers` | 6 | Transformer blocks |
+| `n_heads` | 6 | Attention heads per block |
+| `d_embed` | 384 | Numbers per token vector |
+| `dropout` | 0.1 | Fraction of values randomly zeroed during training |
+
+### Part A: embeddings
+
+- **Token embedding** `nn.Embedding(3005, 384)`: a table with one row of 384 numbers per token. Training adjusts the rows so tokens with similar roles get similar vectors.
+- **Position embedding** `nn.Embedding(512, 384)`: attention has no sense of order, so each position gets its own learned vector, **added** to the token vector.
+- **Dropout:** during training, randomly zeroes 10% of values so the model cannot depend on any single one. Reduces overfitting. Off during generation.
+
+### Part B: causal self-attention
+
+How each token gathers information from earlier tokens.
+
+| Vector | Question it answers |
+|--------|---------------------|
+| **Query** (q) | What am I looking for? |
+| **Key** (k) | What do I contain? |
+| **Value** (v) | What information do I pass on? |
+
+1. `q @ kᵀ`: a score for every pair of tokens (how well a query matches a key).
+2. Divide by `√64`: keeps scores small so softmax does not become extreme.
+3. **Causal mask:** scores for future tokens become `-inf`, so they get **zero** weight.
+   ```
+           sees→ 0  1  2  3
+   token 0:      1  0  0  0
+   token 1:      1  1  0  0
+   token 2:      1  1  1  0
+   token 3:      1  1  1  1
+   ```
+   Why: during generation the future does not exist yet; if the model could peek in training, it would learn to copy the answer.
+4. **Softmax:** each row of scores becomes weights that sum to 1.
+5. `att @ v`: each token's output is a weighted average of the value vectors it attends to.
+6. **Multi-head (6 heads of 64 numbers):** each head can learn a different relationship. `proj` combines them.
+
+### Parts C and D: feed-forward and the block
+
+- **Feed-forward:** `384 -> 1536 -> GELU -> 384`, applied to each token separately. Attention moves information **between** tokens; feed-forward **processes** it. About two-thirds of each block's parameters are here.
+- **GELU:** a non-linear activation. Without it, stacked linear layers collapse into one and cannot learn complex patterns.
+- **Block:**
+  ```python
+  x = x + self.attn(self.ln1(x))  # tokens exchange information
+  x = x + self.ff(self.ln2(x))    # each token processes what it gathered
+  ```
+- **Residual connection (`x + ...`):** each layer adds a correction instead of replacing `x`. Gradients flow straight back through the `+`, so deep stacks still learn.
+- **Layer norm:** rescales each token's vector to mean 0, variance 1. Keeps values stable through many layers.
+- **Pre-norm:** layer norm **before** each sub-layer (modern GPT style); trains more stably.
+- Input and output shapes are the same `(B, T, 384)`, which is why blocks can be stacked.
+
+### Part E: the full GPT
+
+- **`nn.ModuleList`:** a list of layers PyTorch tracks, so their parameters get trained.
+- **Logits:** for every position, 3,005 scores (one per token). Highest score = best guess.
+- **Weight tying:** the output layer reuses the token embedding table (`head.weight = emb.tok.weight`). Saves 1.15M parameters and helps on small data. GPT-2 does the same.
+- **Weight init (`std=0.02`):** small random starting weights. Too large: outputs explode. All zero: every neuron learns the same thing.
+- **Starting loss check:** an untrained model should give every token about 1/3005 probability, so loss ≈ `ln(3005) = 8.01`. Ours: **8.06**. A standard first sanity check.
+- **`loss.backward()`:** backpropagation computes the gradient for all 12M weights.
+
+### Model size
+
+```
+embeddings (shared with head):   1,350,528
+6 blocks x 1,774,464:           10,646,784
+   attention      591,360
+   feed-forward 1,181,568
+   2 layer norms    1,536
+final layer norm:                      768
+total:                          11,998,080
+```
+
+The README estimated about 15M; weight tying and the smaller vocabulary (3,005 instead of 8,000) made it about 12M.
+
+### Part F: model tests (`tests/test_model.py`)
+
+- Most tests use a **tiny model** (2 layers, 32 numbers, 50 tokens) so they run fast; the logic is the same.
+
+| Test | Checks that... |
+|------|----------------|
+| output shapes | `(3, 10)` in gives `(3, 10, vocab)` out |
+| full-size parameter count | exactly 11,998,080 |
+| weight tying | output layer and embedding are the same matrix |
+| initial loss | about `ln(vocab)` |
+| ignored targets | `-100` targets are really skipped (loss mask works) |
+| attention / model causal | changing future tokens does not change earlier outputs |
+| backward | every weight gets a gradient |
+| memorise one batch | 100 training steps cut the loss by more than 80% |
+
+- Run all tests: `python -m unittest tests.test_tokenizer tests.test_model` (20 tests).
+
+### Built is not trained
+
+| | Status |
+|---|--------|
+| Architecture (`model/gpt.py`) | The structure: the code that defines the model |
+| Weights | Random until training; `GPT(cfg)` always creates a new random model in memory |
+| Trained model | Exists only after training, saved to `checkpoints/best.pt` |
+
+---
+
+## Training (step 06)
+
+### The training loop
+
+Every neural network is trained with these 4 lines, repeated:
+```python
+_, loss = model(x, y)      # 1. forward: predict and measure the loss
+optimizer.zero_grad()      # 2. clear old gradients
+loss.backward()            # 3. backpropagation: gradient for every weight
+optimizer.step()           # 4. AdamW nudges every weight to reduce the loss
+```
+
+### Part A: sanity check (`training/sanity_check.py`)
+
+- Train on **5 examples only** and check the model can **memorize** them. If it cannot, full training will fail too, and the problem is much faster to find here.
+- Result: loss **8.04 -> 0.02** in 200 steps, and the model wrote example 0's spec **exactly**, stopping at `<eos>` by itself.
+
+| Loss | Meaning |
+|------|---------|
+| 8.04 | Random guessing |
+| 2.0 | Learned common patterns (field names, structure) |
+| 0.4 | Most tokens right |
+| 0.02 | Almost perfect (correct token gets about 98% probability) |
+
+- **Lesson: learning rate matters.** With `1e-3` the loss got stuck around 5.6; with `3e-4` it learned. Too high a learning rate makes updates jump around instead of settling.
+- This is **overfitting on purpose**, to prove the model can learn. Dropout is off (`0.0`) here because dropout fights memorization.
+- **Greedy decoding** (preview of step 07): give the model `<bos> <intent> ... <spec>`, pick the highest-scoring token (`argmax`), add it, repeat until `<eos>`.
+
+### Part B: full training (`training/train.py`)
+
+| Feature | What it does | Why |
+|---------|--------------|-----|
+| Epochs (20) | All 800 pairs, 20 times | Learn from everything |
+| Validation | Loss on the 100 val pairs after each epoch, no learning | Detect overfitting |
+| Best checkpoint | Saved only when val loss improves | Keep the version that generalizes best |
+| Early stopping (`PATIENCE = 4`) | Stop if val loss does not improve for 4 epochs | Do not waste time overfitting |
+| Warm-up (50 steps) | Learning rate ramps from 0 to `3e-4` | Random weights + big updates = unstable start |
+| Cosine decay | Learning rate falls smoothly to `3e-5` | Learn fast in the middle, fine-tune at the end |
+| Gradient clipping (`1.0`) | Caps the size of one update | One bad batch cannot wreck the weights |
+| Weight decay (`0.1`) | Gently pulls weights toward zero | Reduces overfitting |
+| Dropout (`0.1`) | On again | Reduces overfitting |
+| Log file | `experiements/train_log.csv` | For loss curves later |
+
+Learning-rate schedule:
+```
+LR
+3e-4 |    /‾‾‾‾\
+     |   /      ‾‾\
+     |  /          ‾‾\__
+3e-5 | /                ‾‾‾‾
+     +----------------------- steps
+      warm-up   cosine decay
+```
+
+- **`model.eval()` + `@torch.no_grad()` in `evaluate`:** dropout off and no gradient tracking, so validation is deterministic, faster and never changes the weights.
+- **Validation loss is averaged per spec token**, so batches with longer specs count more, the same as in training.
+- **Checkpoint contents:** weights (`state_dict`), model config, epoch, val loss. About 48 MB; not committed (`checkpoints/` is in `.gitignore`).
+
+### Running on CPU
+
+- No GPU (`torch 2.15.0+cpu`), so training runs on the CPU.
+- One step: about 3-4 seconds. One epoch (50 steps + validation): about 3.5 minutes. 20 epochs: about **70 minutes**.
+- `Ctrl + C` stops training; the best checkpoint so far is kept.
+
+### First results (2-epoch test run)
+
+```
+epoch 1 | train 6.70 | val 5.39
+epoch 2 | train 4.94 | val 4.73
+```
+
+### Full 20-epoch results
+
+Run: `python -m training.train`, 1000 steps, 71.5 minutes on CPU. Log: `experiements/train_log.csv`.
+
+| Epoch | Train loss | Val loss | Gap (val - train) | LR |
+|---|---|---|---|---|
+| 1 | 6.6952 | 5.3866 | -1.31 | 3.00e-04 |
+| 2 | 4.8640 | 4.4739 | -0.39 | 2.98e-04 |
+| 5 | 3.6789 | 3.7582 | 0.08 | 2.72e-04 |
+| 10 | 2.9921 | 3.3964 | 0.40 | 1.77e-04 |
+| 15 | 2.5866 | 3.2897 | 0.70 | 7.39e-05 |
+| 18 | 2.4556 | 3.2808 | 0.83 | 3.75e-05 |
+| **19** | **2.4262** | **3.2768** | 0.85 | 3.19e-05 |
+| 20 | 2.4052 | 3.2787 | 0.87 | 3.00e-05 |
+
+**Best checkpoint: epoch 19, val loss 3.2768.**
+
+How to read it:
+
+- **Epochs 1-2, val lower than train.** The train loss is the average over the whole epoch, including the bad early steps. Val is measured at the end of the epoch, when the model is already better. Dropout is also on during training and off during val.
+- **Epochs 1-8, fast learning.** Val dropped from 5.39 to 3.49. The model learned the spec format: field names, their order, the 12-space indent, `- ` before features, and stopping at `<eos>`.
+- **Epochs 9-20, slow learning.** Val dropped only 0.22 more. The format is learned. What is left is the content (which features or tech stack fit an intent), which is hard to learn from 800 examples.
+- **The gap grew from 0.08 to 0.87.** Train loss kept going down, but val loss stopped. This is overfitting: the model is starting to memorize the training specs instead of learning general rules. It is mild here, because val did not go back up.
+- **Epochs 18 and 20 did not save.** Their val loss was slightly worse than the best. Early stopping needs 4 epochs in a row without improvement, so it never triggered. All 20 epochs ran.
+- **Low LR at the end.** The cosine schedule brought LR down to 3e-5, so the last epochs made only small, fine adjustments.
+
+What the loss number means:
+
+- Loss is the average of `-ln(probability of the correct next token)`.
+- **Perplexity** = `e^loss`. It is roughly "how many tokens the model is choosing between" at each step.
+
+| | Loss | Perplexity |
+|---|---|---|
+| Random start (3005 tokens) | 8.06 | about 3005 |
+| Best val (epoch 19) | 3.28 | about 26 |
+| Train (epoch 20) | 2.41 | about 11 |
+
+- The model went from guessing among 3005 tokens to about 26.
+- Most of the remaining loss comes from content tokens (feature wording, tool names), where many answers are correct. Format tokens (`Type:`, indent, `<eos>`) are almost certain now.
+- The loss does not show if the specs are good. Step 07 (generation) and step 08 (evaluation) will show that.
+
+Why val loss stopped at about 3.28:
+
+- **Limited data.** 183k training tokens for 12M parameters. Chinchilla suggests about 20 tokens per parameter, which would be about 240M tokens. The model is data-limited, not size-limited.
+- Ways to improve later: more data, a smaller model, higher dropout, or fine-tuning a pretrained model (phase 2, Flan-T5).
+
+### Training files
+
+| File | What it is |
+|------|------------|
+| `training/sanity_check.py` | Overfit 5 examples to prove the pipeline learns |
+| `training/train.py` | Full training. Run: `python -m training.train` |
+| `checkpoints/best.pt` | The trained model (best val loss) |
+| `experiements/train_log.csv` | Train/val loss per epoch |
 
 ---
