@@ -120,9 +120,15 @@ draft_examples.md  -->  dataset.jsonl  -->  token IDs (.bin / .pt / .npy)
 - **Shuffle before splitting:** the dataset is ordered by category; without shuffling, the test set would contain only one category.
 - **Fixed seed (`42`):** the same shuffle every run, so the split is reproducible.
 
-### Next: Step 03, build the tokenizer
+### Step 03: Build the tokenizer
 
-- Watch Karpathy's "Let's build the GPT Tokenizer" first.
+- Built a BPE tokenizer from scratch: 3,000 tokens + 5 special = **3,005**.
+- Trained on `train.jsonl` only, saved to `tokenizer/bpe_3000.json`, with 11 unit tests.
+- Details: see **Tokenization (BPE)** below.
+
+### Next: Step 04, prepare the training data
+
+- Turn every pair into token IDs, choose a max sequence length, build a PyTorch `Dataset` and `DataLoader`.
 
 ---
 
@@ -273,5 +279,80 @@ Text: `"Type:       Web application"`
 | `<eos>` | End of sequence; tells the model when to stop |
 | `<intent>` | Marks where the intent starts |
 | `<spec>` | Marks where the spec starts |
+
+### Part B: training the tokenizer (`train()`)
+
+- **Pre-splitting (`SPLIT_PATTERN`):** before BPE, the text is cut into chunks (words, numbers, punctuation, whitespace).
+  `"Type:       Web application"` -> `["Type", ":", "      ", " Web", " application"]`
+  Merges only happen inside a chunk, so a token never glues a word to punctuation (no `"e: W"` tokens). GPT-2 does the same.
+- **Count unique chunks (speed):** `" application"` appears hundreds of times but is stored once with its count. Pair counts are weighted by that count. Same result, about 30 seconds instead of hours.
+- **The loop:** count pairs -> pick the most frequent -> merge it everywhere -> record it.
+  - `self.merges[(a, b)] = new_id`: the rule (used by `encode`)
+  - `self.vocab[new_id] = bytes_a + bytes_b`: what the token means (used by `decode`)
+- **Result on our data:** 665,289 characters, 2,744 merges, about 27 seconds.
+  - First merges are runs of spaces (from the column-13 padding), then common pieces (`er`, ` a`, `in`).
+  - `"\n           "` (newline + 11 spaces) became one token: our continuation-line indent.
+  - Last merges are whole words seen only about 13 times. With 8,000 tokens, many would be seen only 2-3 times, which is why we chose 3,000.
+
+### Part C: `encode()` and `decode()`
+
+- **`encode(text)`:** split into chunks -> bytes -> apply merges. When several pairs could merge, take the one **learned earliest** (lowest ID). This repeats the training order, so the same text always gives the same IDs.
+- **`decode(ids)`:** look up each ID's bytes, join them, turn them into text. `errors="replace"` shows a bad byte sequence as `�` instead of crashing.
+
+Results:
+
+| Result | Meaning |
+|--------|---------|
+| 27 characters -> 5 tokens | `Type`, `:`, padding, ` Web`, ` application` |
+| Round trip OK on train, val and test | `decode(encode(x)) == x` for every pair. Nothing is lost, even for text the tokenizer never saw (it falls back to bytes). |
+| About 3.65 characters per token | Compression: sequences are about 3.65x shorter than raw characters, so training is faster. Val/test are almost the same as train, so the vocabulary generalizes. |
+
+### Part D: special tokens, `save()` and `load()`
+
+- Special tokens get IDs **after** the normal tokens: `<pad>` 3000, `<bos>` 3001, `<eos>` 3002, `<intent>` 3003, `<spec>` 3004.
+- **Full vocabulary = 3,005.** The model needs this number (step 05).
+- `encode(text)` never produces special IDs, so a user typing `"<eos>"` cannot break anything.
+- **`encode_pair()`** builds one training sequence:
+  ```
+  <bos> <intent> ...intent... <spec> ...spec... <eos>
+  ```
+  - `<intent>` / `<spec>` mark which part is which.
+  - `<eos>` teaches the model when to stop. Generation stops when the model outputs 3002.
+  - Without a spec, it stops after `<spec>`. That is the **prompt** used when generating: "here is the intent, now write the spec".
+- A typical pair is about **164 tokens** (used to choose the max sequence length in step 04).
+- **`save()`** stores only the merge list (in order) and the special tokens in `tokenizer/bpe_3000.json` (about 33 KB).
+- **`load()`** rebuilds the vocabulary by replaying the merges.
+- Train the tokenizer **once**; every later step just loads the file.
+
+### Part E: unit tests (`tests/test_tokenizer.py`)
+
+- **Why:** if `bpe.py` changes later and something breaks, the tests catch it immediately.
+- **How `unittest` works:** each method starting with `test_` is one test. `assertEqual(a, b)` fails if `a != b`. `setUpClass` runs once before all tests.
+- Run: `python -m unittest tests.test_tokenizer -v`
+
+| Test | Checks that... |
+|------|----------------|
+| `get_stats`, `merge` | the core functions give correct results |
+| merge does not overlap | `[5,5,5]` -> `[9,5]`, not `[9,9]` |
+| vocab size | 3,005 tokens |
+| special tokens | all 5 exist and decode to their names |
+| edge cases | empty text, spaces, emoji, accents, typos survive encode -> decode |
+| user text never becomes special | typing `"<eos>"` does not produce the real `<eos>` ID |
+| all data round trip | all 1,000 pairs survive encode -> decode |
+| `encode_pair` format | starts `<bos> <intent>`, ends `<eos>` |
+| prompt | ends at `<spec>`, no `<eos>` |
+| save / load | a reloaded tokenizer gives the same IDs |
+
+### Tokenizer files
+
+| File | What it is |
+|------|------------|
+| `tokenizer/bpe.py` | The tokenizer code (`BPETokenizer` class) |
+| `tokenizer/train_tokenizer.py` | Trains on `train.jsonl` and saves the result. Run: `python -m tokenizer.train_tokenizer` |
+| `tokenizer/bpe_3000.json` | The trained tokenizer (merges + special tokens) |
+| `tokenizer/try_encode.py`, `try_special.py` | Small scripts to see the tokenizer working |
+| `tests/test_tokenizer.py` | Unit tests |
+
+- **Why `python -m tokenizer.train_tokenizer`:** `-m` runs the file as a module from the project root, so Python can find the `tokenizer` package for `from tokenizer.bpe import ...`.
 
 ---
