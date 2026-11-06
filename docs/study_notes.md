@@ -62,3 +62,147 @@ draft_examples.md  -->  dataset.jsonl  -->  token IDs (.bin / .pt / .npy)
 - **Phase 2 (T5):** Hugging Face loads the same JSONL and turns it into Arrow by itself.
 
 ---
+
+## What we have done so far
+
+### Step 00: Environment setup
+
+- Created the project folders and a Python virtual environment (`.venv`), so this project's packages stay separate from the rest of the computer.
+- Installed PyTorch, NumPy, pandas, scikit-learn, matplotlib and JupyterLab.
+- `requirements.txt` lists only the packages we chose. A full `pip freeze` broke on Windows, because it also listed Linux-only GPU packages.
+- Set up git, and a `.gitignore` for files that should not be saved (`.venv/`, checkpoints, processed data).
+- Git identity: GitHub links commits to an account by **email**. This project uses its own email, set with `git config` (no `--global`), so commits show the right account.
+
+### Step 01: Define the spec format
+
+- The model learns by copying the pattern in its training outputs. If the outputs are inconsistent, the model learns the inconsistency.
+- So we fixed one exact format before writing any data: `docs/spec_format.md`.
+- Fields, always in this order: `Type`, `Auth`, `Data model`, `Features`, `Input`, `API`, `Storage`, `Tech stack`.
+- Required: `Type`, `Features`, `Tech stack`. The rest are optional.
+- Main rule: if a field does not apply, **leave it out** (never write `None`).
+- Wrote 10 hand-made "gold" examples (web, mobile, script, API, game, data analysis, extension, chatbot, dashboard, desktop) to test the format.
+
+### Step 02: Build the dataset
+
+**How much data?**
+- A ~15M-parameter model trained from scratch knows no English, so it must learn the language, the technical concepts and the format from our pairs alone.
+- About 1,000 pairs teaches the format; about 5,000 gives useful results; 10,000+ is better.
+- Plan: 1,000 now to get the whole pipeline working, then grow to 5,000 based on what the model gets wrong.
+- Variety and correctness matter more than raw count.
+
+**How the data was made:**
+- Generated 990 pairs with a large LLM, in 10 categories of 99 (web, mobile, scripts, APIs, data/ML, games, extensions/desktop/CLI, bots/AI, dashboards/IoT, small business).
+- Mixed writing styles in the intents: casual, short and vague, long, typos, non-native English.
+- Checked: every pair valid, no duplicate intents.
+
+**Scripts (in `scripts/`):**
+
+| Script | What it does |
+|--------|--------------|
+| `draft_to_jsonl.py` | Reads `draft_examples.md`, writes `dataset.jsonl` (one pair per line) |
+| `validate_specs.py` | Checks every spec follows `spec_format.md`: field names, order, required fields, no `None`, `- ` bullets, alignment |
+| `split_dataset.py` | Shuffles and splits the dataset into train / validation / test |
+
+- Always edit `draft_examples.md`, then re-run `draft_to_jsonl.py` and `validate_specs.py`. Edits made directly in `dataset.jsonl` get overwritten.
+- A JSONL file looks like "one line" in the editor because each line is very long. Turn word wrap on or off with `Alt + Z`.
+
+**Train / validation / test split:**
+
+| File | Pairs | Purpose |
+|------|-------|---------|
+| `data/raw/train.jsonl` | 800 | The model learns from these |
+| `data/raw/val.jsonl` | 100 | Checked during training to detect overfitting and choose the best checkpoint |
+| `data/evaluation/test.jsonl` | 100 | Used once at the end, for the final honest score |
+
+- **Why split:** testing on data the model trained on only measures memorization. It must be tested on unseen data.
+- **Overfitting:** training loss keeps going down but validation loss starts going up. The model is memorizing, not learning. Keep the checkpoint with the lowest validation loss.
+- **Why test is separate from validation:** many decisions are made using validation results, so the model becomes slightly tuned to it. The test set is never used for decisions, so its score is unbiased.
+- **Shuffle before splitting:** the dataset is ordered by category; without shuffling, the test set would contain only one category.
+- **Fixed seed (`42`):** the same shuffle every run, so the split is reproducible.
+
+### Next: Step 03, build the tokenizer
+
+- Watch Karpathy's "Let's build the GPT Tokenizer" first.
+
+---
+
+## Key ML terms
+
+### Data and the model
+
+| Term | Meaning |
+|------|---------|
+| **Token** | A small piece of text (a word or part of a word) that the model reads as a number |
+| **Vocabulary** | The full list of tokens the tokenizer knows (we plan about 8,000) |
+| **Parameters / weights** | The numbers inside the model that training adjusts. Our model has about 15 million. |
+| **Next-token prediction** | The model's only job: given the tokens so far, predict the next one. A full spec is generated one token at a time. |
+| **Training from scratch** | Starting with random weights; the model knows nothing, not even English |
+| **Pretrained model** | A model already trained on huge amounts of text (like Flan-T5); it already knows the language |
+| **Fine-tuning** | Training a pretrained model a little more on our task (phase 2) |
+
+### Training
+
+| Term | Meaning |
+|------|---------|
+| **Batch** | A small group of examples processed together (e.g. 16 pairs) |
+| **Step** | One weight update, done after each batch |
+| **Epoch** | One full pass through all the training data |
+| **Optimizer** | The algorithm that updates the weights to reduce the loss (we use AdamW) |
+| **Learning rate** | How big each weight update is. Too high: training is unstable. Too low: training is very slow. |
+| **Backpropagation** | The method that works out how much each weight contributed to the error, so it can be adjusted |
+| **Checkpoint** | A saved copy of the model's weights at some point in training |
+
+With our data:
+```
+800 pairs / batch size 16 = 50 steps per epoch
+20 epochs x 50 steps      = 1,000 weight updates
+```
+
+### Loss
+
+- **Loss:** one number that says how wrong the model's predictions are. Lower is better.
+- **Cross-entropy loss:** `loss = -log(probability the model gave to the correct token)`, averaged over all tokens.
+
+| Probability given to the correct token | Loss |
+|----------------------------------------|------|
+| 0.99 | 0.01 (almost perfect) |
+| 0.70 | 0.36 |
+| 0.10 | 2.30 |
+| 0.001 | 6.9 (very wrong) |
+
+- Starting point: a random model with an 8,000-token vocabulary has a loss of about `ln(8000) ≈ 9.0`.
+
+### Train loss vs. validation loss
+
+| | Measured on | Model learns from it? |
+|---|-------------|-----------------------|
+| **Train loss** | `train.jsonl` (800) | Yes |
+| **Val loss** | `val.jsonl` (100) | No, only measured |
+
+- Train loss: how well the model fits the data it learns from.
+- Val loss: how well it handles data it has never seen. **This is the one that matters.**
+
+Example training log:
+```
+epoch   train loss   val loss
+  1        6.5          6.6     just started
+  5        2.1          2.3     learning
+ 10        0.9          1.2     still fine
+ 15        0.3          1.1     lowest val loss -> save this checkpoint
+ 20        0.1          1.5     val rising -> overfitting
+```
+
+| What you see | Meaning | What to do |
+|--------------|---------|------------|
+| Both falling | Learning well | Keep training |
+| Train falling, val rising | **Overfitting** (memorizing) | Stop; use the checkpoint with the lowest val loss |
+| Both stuck high | **Underfitting** (not learning enough) | Bigger model, tune the learning rate, train longer |
+
+### Data size
+
+- **Chinchilla rule of thumb:** a model needs about 20 training tokens per parameter.
+  `15M params x 20 = 300M tokens ≈ 1.2 million pairs` (far more than we can make).
+- So a from-scratch model will be limited by data. A pretrained model (phase 2) needs far fewer examples, because it already knows the language.
+- **Random seed:** a fixed number that makes "random" operations (shuffling, weight initialization) give the same result every run, so experiments are reproducible.
+
+---
