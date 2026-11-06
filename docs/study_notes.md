@@ -206,3 +206,72 @@ epoch   train loss   val loss
 - **Random seed:** a fixed number that makes "random" operations (shuffling, weight initialization) give the same result every run, so experiments are reproducible.
 
 ---
+
+## Tokenization (BPE)
+
+### What a tokenizer does
+
+The model only works with numbers. The tokenizer converts text to numbers and back:
+
+```
+"Type: Web application"  --encode-->  [412, 7, 1893, 655]
+[412, 7, 1893, 655]      --decode-->  "Type: Web application"
+```
+
+### How BPE (Byte Pair Encoding) works
+
+```
+1. Start:  text -> bytes. Each byte (0-255) is one token.  vocab = 256
+2. Count every adjacent pair of tokens in the training text.
+3. Merge the most frequent pair into a new token (ID 256, 257, ...).
+4. Repeat until the vocabulary reaches the target size.
+```
+
+- **Encoding:** apply the learned merges to new text, in the same order they were learned.
+- **Decoding:** turn each ID back into its bytes and join them.
+- **Starting from bytes means no unknown tokens:** any text (typos, emoji, other languages) can be encoded.
+- Frequent pieces like `Type:`, `application` and `POST /` end up as single tokens, so the text gets shorter in tokens.
+
+### The two core functions (`tokenizer/bpe.py`, part A)
+
+| Function | What it does | Example |
+|----------|--------------|---------|
+| `get_stats(ids)` | Counts how often each neighbouring pair of IDs appears | `[1, 2, 3, 1, 2]` -> `{(1,2): 2, (2,3): 1, (3,1): 1}` |
+| `merge(ids, pair, new_id)` | Replaces every occurrence of `pair` with `new_id` | `merge([1, 2, 3, 1, 2], (1, 2), 99)` -> `[99, 3, 99]` |
+
+- `get_stats` uses `zip(ids, ids[1:])` to walk through every neighbouring pair.
+- `merge` scans left to right. When it finds the pair, it writes the new ID and skips 2 positions; otherwise it copies the token and moves 1.
+
+Full BPE training is these two functions in a loop:
+```
+repeat N times:
+    stats = get_stats(ids)
+    top   = most frequent pair
+    ids   = merge(ids, top, next_new_id)
+```
+
+### First merge on our own spec text
+
+Text: `"Type:       Web application"`
+
+| Result | Meaning |
+|--------|---------|
+| 27 bytes: `[84, 121, 112, ...]` | Each character is one byte. `84` = `T`, `121` = `y`, `32` = space. |
+| Most frequent pair: `(32, 32)`, 6 times | Space + space, because specs pad field names to column 13 |
+| After the merge: 24 tokens | 7 spaces became `[256, 256, 256, 32]`: 3 merges, not 6, because a merged byte is not reused |
+
+### Decisions for our tokenizer
+
+- **Vocabulary size:** 2,000-4,000 (not 8,000), because our training text is small (about 700 KB). With too many tokens, many appear only a few times and the model cannot learn them well.
+- **Train the tokenizer on `train.jsonl` only.** Using validation or test text would leak information from them.
+- **Special tokens:**
+
+| Token | Purpose |
+|-------|---------|
+| `<pad>` | Fills short sequences so all sequences in a batch have the same length |
+| `<bos>` | Beginning of sequence |
+| `<eos>` | End of sequence; tells the model when to stop |
+| `<intent>` | Marks where the intent starts |
+| `<spec>` | Marks where the spec starts |
+
+---
